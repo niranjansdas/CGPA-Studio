@@ -1,17 +1,57 @@
 
 import sqlite3
+import os
+import sys
+import shutil
+
+from pathlib import Path
 from contextlib import contextmanager
+from datetime import datetime
 
 
 class CGPADatabase:
 
     def __init__(self, database_name="cgpa_studio.db"):
-        self.database_name = database_name
+
+        # Find the folder containing the application.
+        if getattr(sys, "frozen", False):
+            application_folder = Path(sys.executable).resolve().parent
+        else:
+            application_folder = Path(__file__).resolve().parent
+
+        # Choose a suitable location for the database.
+        if os.name == "nt":
+            base_folder = Path(
+                os.environ.get(
+                    "LOCALAPPDATA",
+                    Path.home() / "AppData" / "Local"
+                )
+            )
+        else:
+            base_folder = Path.home() / ".local" / "share"
+
+        self.data_folder = base_folder / "CGPAStudio"
+        self.data_folder.mkdir(parents=True, exist_ok=True)
+
+        self.database_path = self.data_folder / database_name
+        self.database_name = str(self.database_path)
+
+        # Migrate an existing database on first run.
+        old_database = application_folder / database_name
+
+        if (
+            not self.database_path.exists()
+            and old_database.exists()
+            and old_database.resolve() != self.database_path.resolve()
+        ):
+            shutil.copy2(old_database, self.database_path)
+
         self.create_tables()
 
-    # CONNECT TO DATABASE
+    # DATABASE CONNECTION
     @contextmanager
     def connection(self):
+
         conn = sqlite3.connect(self.database_name)
         conn.row_factory = sqlite3.Row
 
@@ -55,7 +95,6 @@ class CGPADatabase:
                 )
             """)
 
-            # Create Semester 1 if database is empty
             conn.execute("""
                 INSERT OR IGNORE INTO semesters (name)
                 VALUES ('Semester 1')
@@ -74,6 +113,7 @@ class CGPADatabase:
     def get_semesters(self):
 
         with self.connection() as conn:
+
             rows = conn.execute("""
                 SELECT name
                 FROM semesters
@@ -107,6 +147,7 @@ class CGPADatabase:
             subjects = {}
 
             for row in rows:
+
                 subject_id = str(row["id"])
 
                 subjects[subject_id] = {
@@ -152,6 +193,7 @@ class CGPADatabase:
         points = credits * grade
 
         with self.connection() as conn:
+
             conn.execute("""
                 UPDATE subjects
                 SET name = ?,
@@ -208,3 +250,127 @@ class CGPADatabase:
             """).fetchall()
 
             return [dict(row) for row in rows]
+
+    # CREATE A DATABASE BACKUP
+    def create_backup(self, backup_path):
+
+        backup_path = Path(backup_path)
+
+        if backup_path.resolve() == self.database_path.resolve():
+            raise ValueError(
+                "Backup cannot overwrite the active database."
+            )
+
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+
+        source = sqlite3.connect(self.database_name)
+        destination = sqlite3.connect(str(backup_path))
+
+        try:
+            source.backup(destination)
+
+        finally:
+            destination.close()
+            source.close()
+
+        return str(backup_path)
+
+    # RESTORE A DATABASE BACKUP
+    def restore_backup(self, backup_path):
+
+        backup_path = Path(backup_path)
+
+        if not backup_path.is_file():
+            raise FileNotFoundError("Backup file does not exist.")
+
+        if backup_path.resolve() == self.database_path.resolve():
+            raise ValueError(
+                "Selected file is already the active database."
+            )
+
+        # Validate the selected backup.
+        check = sqlite3.connect(
+            f"file:{backup_path.resolve().as_posix()}?mode=ro",
+            uri=True
+        )
+
+        try:
+
+            integrity = check.execute(
+                "PRAGMA integrity_check"
+            ).fetchone()[0]
+
+            if integrity != "ok":
+                raise ValueError(
+                    "The selected database is damaged."
+                )
+
+            tables = {
+                row[0]
+                for row in check.execute("""
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                """).fetchall()
+            }
+
+            if not {"semesters", "subjects"}.issubset(tables):
+                raise ValueError(
+                    "This is not a valid CGPA Studio database."
+                )
+
+            required_columns = {
+                "semesters": {"id", "name"},
+                "subjects": {
+                    "id", "semester_id", "name",
+                    "credits", "grade", "points"
+                }
+            }
+
+            for table, expected_columns in required_columns.items():
+
+                actual_columns = {
+                    row[1]
+                    for row in check.execute(
+                        f"PRAGMA table_info({table})"
+                    ).fetchall()
+                }
+
+                if not expected_columns.issubset(actual_columns):
+                    raise ValueError(
+                        "The selected database has an incompatible structure."
+                    )
+
+        finally:
+            check.close()
+
+        # Create a uniquely named safety backup of current data.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        safety_path = (
+            self.data_folder /
+            f"before_restore_{timestamp}.db"
+        )
+
+        current = sqlite3.connect(self.database_name)
+        safety = sqlite3.connect(str(safety_path))
+
+        try:
+            current.backup(safety)
+
+        finally:
+            safety.close()
+            current.close()
+
+        # Restore the selected backup.
+        source = sqlite3.connect(str(backup_path))
+        destination = sqlite3.connect(self.database_name)
+
+        try:
+            source.backup(destination)
+
+        finally:
+            destination.close()
+            source.close()
+
+        return str(safety_path)
